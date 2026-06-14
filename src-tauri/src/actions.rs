@@ -696,6 +696,277 @@ impl ShortcutAction for TestAction {
     }
 }
 
+// Api Transcribe Action
+struct ApiTranscribeAction {
+    api_destination_id: String,
+}
+
+impl ShortcutAction for ApiTranscribeAction {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        let start_time = Instant::now();
+        debug!(
+            "ApiTranscribeAction::start called for binding: {} (dest: {})",
+            binding_id, self.api_destination_id
+        );
+
+        let tm = app.state::<Arc<TranscriptionManager>>();
+        let rm = app.state::<Arc<AudioRecordingManager>>();
+
+        tm.initiate_model_load();
+        let rm_clone = Arc::clone(&rm);
+        std::thread::spawn(move || {
+            if let Err(e) = rm_clone.preload_vad() {
+                debug!("VAD pre-load failed: {}", e);
+            }
+        });
+
+        let binding_id = binding_id.to_string();
+        change_tray_icon(app, TrayIconState::Recording);
+        show_recording_overlay(app);
+
+        let settings = get_settings(app);
+        let is_always_on = settings.always_on_microphone;
+
+        let mut recording_error: Option<String> = None;
+        if is_always_on {
+            let rm_clone = Arc::clone(&rm);
+            let app_clone = app.clone();
+            std::thread::spawn(move || {
+                play_feedback_sound_blocking(&app_clone, SoundType::Start);
+                rm_clone.apply_mute();
+            });
+
+            if let Err(e) = rm.try_start_recording(&binding_id) {
+                debug!("Recording failed: {}", e);
+                recording_error = Some(e);
+            }
+        } else {
+            match rm.try_start_recording(&binding_id) {
+                Ok(()) => {
+                    let app_clone = app.clone();
+                    let rm_clone = Arc::clone(&rm);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        play_feedback_sound_blocking(&app_clone, SoundType::Start);
+                        rm_clone.apply_mute();
+                    });
+                }
+                Err(e) => {
+                    debug!("Failed to start recording: {}", e);
+                    recording_error = Some(e);
+                }
+            }
+        }
+
+        if recording_error.is_none() {
+            shortcut::register_cancel_shortcut(app);
+        } else {
+            utils::hide_recording_overlay(app);
+            change_tray_icon(app, TrayIconState::Idle);
+            if let Some(err) = recording_error {
+                let error_type = if is_microphone_access_denied(&err) {
+                    "microphone_permission_denied"
+                } else if is_no_input_device_error(&err) {
+                    "no_input_device"
+                } else {
+                    "unknown"
+                };
+                let _ = app.emit(
+                    "recording-error",
+                    RecordingErrorEvent {
+                        error_type: error_type.to_string(),
+                        detail: Some(err),
+                    },
+                );
+            }
+        }
+
+        debug!(
+            "ApiTranscribeAction::start completed in {:?}",
+            start_time.elapsed()
+        );
+    }
+
+    fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        shortcut::unregister_cancel_shortcut(app);
+
+        let stop_time = Instant::now();
+        debug!(
+            "ApiTranscribeAction::stop called for binding: {} (dest: {})",
+            binding_id, self.api_destination_id
+        );
+
+        let ah = app.clone();
+        let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
+        let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
+        let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
+
+        change_tray_icon(app, TrayIconState::Transcribing);
+        show_transcribing_overlay(app);
+
+        rm.remove_mute();
+        play_feedback_sound(app, SoundType::Stop);
+
+        let binding_id = binding_id.to_string();
+        let api_destination_id = self.api_destination_id.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let _guard = FinishGuard(ah.clone());
+            debug!(
+                "Starting async API transcription task for binding: {}",
+                binding_id
+            );
+
+            if let Some(samples) = rm.stop_recording(&binding_id) {
+                if samples.is_empty() {
+                    debug!("Recording produced no audio samples");
+                    utils::hide_recording_overlay(&ah);
+                    change_tray_icon(&ah, TrayIconState::Idle);
+                } else {
+                    let sample_count = samples.len();
+                    let file_name =
+                        format!("handy-{}.wav", chrono::Utc::now().timestamp());
+                    let wav_path = hm.recordings_dir().join(&file_name);
+                    let wav_path_for_verify = wav_path.clone();
+                    let samples_for_wav = samples.clone();
+                    let wav_handle = tauri::async_runtime::spawn_blocking(move || {
+                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+                    });
+
+                    let transcription_result = tm.transcribe(samples);
+
+                    let wav_saved = match wav_handle.await {
+                        Ok(Ok(())) => {
+                            match crate::audio_toolkit::verify_wav_file(
+                                &wav_path_for_verify,
+                                sample_count,
+                            ) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    error!("WAV verification failed: {}", e);
+                                    false
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            error!("Failed to save WAV file: {}", e);
+                            false
+                        }
+                        Err(e) => {
+                            error!("WAV save task panicked: {}", e);
+                            false
+                        }
+                    };
+
+                    match transcription_result {
+                        Ok(transcription) => {
+                            debug!("Transcription completed: '{}'", transcription);
+
+                            // Save to history if WAV was saved
+                            if wav_saved {
+                                if let Err(err) = hm.save_entry(
+                                    file_name,
+                                    transcription.clone(),
+                                    false,
+                                    None,
+                                    None,
+                                ) {
+                                    error!("Failed to save history entry: {}", err);
+                                }
+                            }
+
+                            if transcription.is_empty() {
+                                utils::hide_recording_overlay(&ah);
+                                change_tray_icon(&ah, TrayIconState::Idle);
+                            } else {
+                                // Look up the URL for this destination
+                                let settings = get_settings(&ah);
+                                let url = settings
+                                    .api_destinations
+                                    .iter()
+                                    .find(|d| d.id == api_destination_id)
+                                    .map(|d| d.url.clone())
+                                    .unwrap_or_default();
+
+                                if url.is_empty() {
+                                    warn!(
+                                        "API destination '{}' has no URL configured",
+                                        api_destination_id
+                                    );
+                                    utils::hide_recording_overlay(&ah);
+                                    change_tray_icon(&ah, TrayIconState::Idle);
+                                } else {
+                                    match post_to_url(&url, &transcription).await {
+                                        Ok(()) => {
+                                            debug!(
+                                                "Successfully POSTed transcription to {}",
+                                                url
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to POST transcription to {}: {}",
+                                                url, e
+                                            );
+                                        }
+                                    }
+                                    utils::hide_recording_overlay(&ah);
+                                    change_tray_icon(&ah, TrayIconState::Idle);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            debug!("API Transcription error: {}", err);
+                            if wav_saved {
+                                if let Err(save_err) = hm.save_entry(
+                                    file_name,
+                                    String::new(),
+                                    false,
+                                    None,
+                                    None,
+                                ) {
+                                    error!(
+                                        "Failed to save failed history entry: {}",
+                                        save_err
+                                    );
+                                }
+                            }
+                            utils::hide_recording_overlay(&ah);
+                            change_tray_icon(&ah, TrayIconState::Idle);
+                        }
+                    }
+                }
+            } else {
+                debug!("No samples retrieved from recording stop");
+                utils::hide_recording_overlay(&ah);
+                change_tray_icon(&ah, TrayIconState::Idle);
+            }
+        });
+
+        debug!(
+            "ApiTranscribeAction::stop completed in {:?}",
+            stop_time.elapsed()
+        );
+    }
+}
+
+/// POST JSON {"text": "..."} to the configured URL.
+async fn post_to_url(url: &str, text: &str) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({"text": text});
+    let response = client
+        .post(url)
+        .json(&body)
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to POST transcription: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("Server returned {}", response.status()));
+    }
+    Ok(())
+}
+
 // Static Action Map
 pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::new(|| {
     let mut map = HashMap::new();
@@ -719,3 +990,24 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
     );
     map
 });
+
+/// Look up a shortcut action by binding_id. Falls back to creating an
+/// ApiTranscribeAction if the id matches an api_destination.
+pub fn get_action_for_binding(
+    app: &AppHandle,
+    binding_id: &str,
+) -> Option<Arc<dyn ShortcutAction>> {
+    if let Some(action) = ACTION_MAP.get(binding_id) {
+        return Some(Arc::clone(action));
+    }
+    let settings = get_settings(app);
+    settings
+        .api_destinations
+        .iter()
+        .find(|d| d.id == binding_id)
+        .map(|d| {
+            Arc::new(ApiTranscribeAction {
+                api_destination_id: d.id.clone(),
+            }) as Arc<dyn ShortcutAction>
+        })
+}

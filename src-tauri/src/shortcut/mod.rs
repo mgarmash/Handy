@@ -54,6 +54,32 @@ pub fn init_shortcuts(app: &AppHandle) {
             }
         }
     }
+
+    // Register shortcuts for API destinations
+    register_api_destination_shortcuts(app);
+}
+
+/// Register shortcuts for all configured API destinations.
+fn register_api_destination_shortcuts(app: &AppHandle) {
+    let settings = settings::get_settings(app);
+    for dest in &settings.api_destinations {
+        if dest.current_binding.is_empty() {
+            continue;
+        }
+        let binding = ShortcutBinding {
+            id: dest.id.clone(),
+            name: dest.name.clone(),
+            description: format!("POST transcription to {}", dest.name),
+            default_binding: dest.current_binding.clone(),
+            current_binding: dest.current_binding.clone(),
+        };
+        if let Err(e) = register_shortcut(app, binding) {
+            warn!(
+                "Failed to register API destination shortcut '{}': {}",
+                dest.id, e
+            );
+        }
+    }
 }
 
 /// Register the cancel shortcut (called when recording starts)
@@ -116,6 +142,58 @@ pub fn change_binding(
     }
 
     let mut settings = settings::get_settings(&app);
+
+    // Handle API destination binding updates
+    if let Some(dest) = settings.api_destinations.iter().position(|d| d.id == id) {
+        let old_binding = settings.api_destinations[dest].current_binding.clone();
+
+        // Unregister the old shortcut
+        if !old_binding.is_empty() {
+            let old = ShortcutBinding {
+                id: id.clone(),
+                name: settings.api_destinations[dest].name.clone(),
+                description: String::new(),
+                default_binding: old_binding.clone(),
+                current_binding: old_binding,
+            };
+            let _ = unregister_shortcut(&app, old);
+        }
+
+        // Validate the new shortcut
+        if let Err(e) =
+            validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
+        {
+            warn!("change_binding validation error: {}", e);
+            return Err(e);
+        }
+
+        // Register the new shortcut
+        let new = ShortcutBinding {
+            id: id.clone(),
+            name: settings.api_destinations[dest].name.clone(),
+            description: String::new(),
+            default_binding: binding.clone(),
+            current_binding: binding.clone(),
+        };
+        if let Err(e) = register_shortcut(&app, new.clone()) {
+            let error_msg = format!("Failed to register shortcut: {}", e);
+            error!("change_binding error: {}", error_msg);
+            return Ok(BindingResponse {
+                success: false,
+                binding: None,
+                error: Some(error_msg),
+            });
+        }
+
+        settings.api_destinations[dest].current_binding = binding;
+        settings::write_settings(&app, settings);
+
+        return Ok(BindingResponse {
+            success: true,
+            binding: Some(new),
+            error: None,
+        });
+    }
 
     // Get the binding to modify, or create it from defaults if it doesn't exist
     let binding_to_modify = match settings.bindings.get(&id) {
@@ -204,6 +282,16 @@ pub fn change_binding(
 #[tauri::command]
 #[specta::specta]
 pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, String> {
+    // Check if this is an API destination
+    let settings = settings::get_settings(&app);
+    if settings.api_destinations.iter().any(|d| d.id == id) {
+        let default_settings = settings::get_default_settings();
+        if let Some(default_dest) =
+            default_settings.api_destinations.iter().find(|d| d.id == id)
+        {
+            return change_binding(app, id, default_dest.current_binding.clone());
+        }
+    }
     let binding = settings::get_stored_binding(&app, &id);
     change_binding(app, id, binding.default_binding)
 }
@@ -213,10 +301,29 @@ pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, Stri
 #[tauri::command]
 #[specta::specta]
 pub fn suspend_binding(app: AppHandle, id: String) -> Result<(), String> {
-    if let Some(b) = settings::get_bindings(&app).get(&id).cloned() {
+    let settings = settings::get_settings(&app);
+    // Check bindings map first
+    if let Some(b) = settings.bindings.get(&id).cloned() {
         if let Err(e) = unregister_shortcut(&app, b) {
             error!("suspend_binding error for id '{}': {}", id, e);
             return Err(e);
+        }
+        return Ok(());
+    }
+    // Check API destinations
+    if let Some(dest) = settings.api_destinations.iter().find(|d| d.id == id) {
+        if !dest.current_binding.is_empty() {
+            let b = ShortcutBinding {
+                id: dest.id.clone(),
+                name: dest.name.clone(),
+                description: String::new(),
+                default_binding: dest.current_binding.clone(),
+                current_binding: dest.current_binding.clone(),
+            };
+            if let Err(e) = unregister_shortcut(&app, b) {
+                error!("suspend_binding error for id '{}': {}", id, e);
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -226,10 +333,29 @@ pub fn suspend_binding(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub fn resume_binding(app: AppHandle, id: String) -> Result<(), String> {
-    if let Some(b) = settings::get_bindings(&app).get(&id).cloned() {
+    let settings = settings::get_settings(&app);
+    // Check bindings map first
+    if let Some(b) = settings.bindings.get(&id).cloned() {
         if let Err(e) = register_shortcut(&app, b) {
             error!("resume_binding error for id '{}': {}", id, e);
             return Err(e);
+        }
+        return Ok(());
+    }
+    // Check API destinations
+    if let Some(dest) = settings.api_destinations.iter().find(|d| d.id == id) {
+        if !dest.current_binding.is_empty() {
+            let b = ShortcutBinding {
+                id: dest.id.clone(),
+                name: dest.name.clone(),
+                description: String::new(),
+                default_binding: dest.current_binding.clone(),
+                current_binding: dest.current_binding.clone(),
+            };
+            if let Err(e) = register_shortcut(&app, b) {
+                error!("resume_binding error for id '{}': {}", id, e);
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -377,6 +503,25 @@ fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementat
             );
         }
     }
+
+    // Also unregister API destination shortcuts
+    let current_settings = settings::get_settings(app);
+    for dest in &current_settings.api_destinations {
+        if dest.current_binding.is_empty() {
+            continue;
+        }
+        let binding = ShortcutBinding {
+            id: dest.id.clone(),
+            name: dest.name.clone(),
+            description: String::new(),
+            default_binding: dest.current_binding.clone(),
+            current_binding: dest.current_binding.clone(),
+        };
+        let _ = match implementation {
+            KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
+            KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
+        };
+    }
 }
 
 /// Register all shortcuts for a specific implementation, validating and resetting invalid ones
@@ -439,6 +584,35 @@ fn register_all_shortcuts_for_implementation(
     // Save settings if any bindings were reset
     if !reset_bindings.is_empty() {
         settings::write_settings(app, current_settings);
+    }
+
+    // Also register API destination shortcuts
+    let api_settings = settings::get_settings(app);
+    for dest in &api_settings.api_destinations {
+        if dest.current_binding.is_empty() {
+            continue;
+        }
+        let binding = ShortcutBinding {
+            id: dest.id.clone(),
+            name: dest.name.clone(),
+            description: String::new(),
+            default_binding: dest.current_binding.clone(),
+            current_binding: dest.current_binding.clone(),
+        };
+        if let Err(e) = validate_shortcut_for_implementation(
+            &binding.current_binding,
+            implementation,
+        ) {
+            warn!(
+                "API destination shortcut '{}' ({}) is invalid for {:?}: {}. Skipping.",
+                dest.id, binding.current_binding, implementation, e
+            );
+            continue;
+        }
+        let _ = match implementation {
+            KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
+            KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
+        };
     }
 
     reset_bindings
@@ -1154,4 +1328,79 @@ pub async fn get_available_accelerators() -> crate::managers::transcription::Ava
     tauri::async_runtime::spawn_blocking(crate::managers::transcription::get_available_accelerators)
         .await
         .expect("get_available_accelerators panicked")
+}
+
+// ============================================================================
+// API Destination Commands
+// ============================================================================
+
+#[tauri::command]
+#[specta::specta]
+pub fn update_api_destination_url(
+    app: AppHandle,
+    id: String,
+    url: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    if let Some(dest) = settings.api_destinations.iter_mut().find(|d| d.id == id) {
+        dest.url = url;
+        settings::write_settings(&app, settings);
+        Ok(())
+    } else {
+        Err(format!("API destination '{}' not found", id))
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn add_api_destination(app: AppHandle) -> Result<settings::ApiDestination, String> {
+    let mut settings = settings::get_settings(&app);
+    // Find the next available id: api_1, api_2, api_3, ...
+    let mut idx = 1u32;
+    loop {
+        let candidate = format!("api_{}", idx);
+        if !settings.api_destinations.iter().any(|d| d.id == candidate) {
+            let dest = settings::ApiDestination {
+                id: candidate.clone(),
+                name: format!("API Target {}", idx),
+                url: String::new(),
+                current_binding: String::new(),
+            };
+            settings.api_destinations.push(dest.clone());
+            settings::write_settings(&app, settings);
+            return Ok(dest);
+        }
+        idx += 1;
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn delete_api_destination(app: AppHandle, id: String) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    // Capture the current binding before removing
+    let current_binding = settings
+        .api_destinations
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.current_binding.clone())
+        .unwrap_or_default();
+    let original_len = settings.api_destinations.len();
+    settings.api_destinations.retain(|d| d.id != id);
+    if settings.api_destinations.len() == original_len {
+        return Err(format!("API destination '{}' not found", id));
+    }
+    // Unregister any shortcut for this destination
+    if !current_binding.is_empty() {
+        let dest_binding = ShortcutBinding {
+            id: id.clone(),
+            name: String::new(),
+            description: String::new(),
+            default_binding: current_binding.clone(),
+            current_binding,
+        };
+        let _ = unregister_shortcut(&app, dest_binding);
+    }
+    settings::write_settings(&app, settings);
+    Ok(())
 }

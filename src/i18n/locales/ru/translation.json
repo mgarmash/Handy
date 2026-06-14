@@ -213,6 +213,13 @@
       "pushToTalk": {
         "label": "Нажми и говори",
         "description": "Удерживайте, чтобы записать, отпустите, чтобы остановить"
+      },
+      "apiDestinations": {
+        "title": "API Назначения",
+        "description": "Настройте HTTP-адреса, на которые будут отправляться транскрипции при нажатии горячей клавиши.",
+        "urlPlaceholder": "https://example.com/api/transcribe",
+        "add": "Добавить API Назначение",
+        "delete": "Удалить"
       }
     },
     "sound": {

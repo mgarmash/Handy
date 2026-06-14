@@ -87,6 +87,14 @@ pub struct ShortcutBinding {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
+pub struct ApiDestination {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub current_binding: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type)]
 pub struct LLMPrompt {
     pub id: String,
     pub name: String,
@@ -430,6 +438,8 @@ pub struct AppSettings {
     pub whisper_gpu_device: i32,
     #[serde(default)]
     pub extra_recording_buffer_ms: u64,
+    #[serde(default = "default_api_destinations")]
+    pub api_destinations: Vec<ApiDestination>,
 }
 
 fn default_model() -> String {
@@ -654,6 +664,23 @@ fn default_typing_tool() -> TypingTool {
     TypingTool::Auto
 }
 
+fn default_api_destinations() -> Vec<ApiDestination> {
+    vec![
+        ApiDestination {
+            id: "api_1".into(),
+            name: "API Target 1".into(),
+            url: "".into(),
+            current_binding: "Ctrl+Shift+A".into(),
+        },
+        ApiDestination {
+            id: "api_2".into(),
+            name: "API Target 2".into(),
+            url: "".into(),
+            current_binding: "Ctrl+Shift+B".into(),
+        },
+    ]
+}
+
 fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
     let mut changed = false;
     for provider in default_post_process_providers() {
@@ -814,6 +841,7 @@ pub fn get_default_settings() -> AppSettings {
         ort_accelerator: OrtAcceleratorSetting::default(),
         whisper_gpu_device: default_whisper_gpu_device(),
         extra_recording_buffer_ms: 0,
+        api_destinations: default_api_destinations(),
     }
 }
 
@@ -885,6 +913,13 @@ pub fn load_or_create_app_settings(app: &AppHandle) -> AppSettings {
     };
 
     if ensure_post_process_defaults(&mut settings) {
+        store.set("settings", serde_json::to_value(&settings).unwrap());
+    }
+
+    // Migrate: ensure api_destinations is populated
+    if settings.api_destinations.is_empty() {
+        let default_settings = get_default_settings();
+        settings.api_destinations = default_settings.api_destinations;
         store.set("settings", serde_json::to_value(&settings).unwrap());
     }
 

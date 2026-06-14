@@ -195,6 +195,13 @@
       "pushToTalk": {
         "label": "Push To Talk",
         "description": "Hold to record, release to stop"
+      },
+      "apiDestinations": {
+        "title": "API Destinations",
+        "description": "Configure HTTP endpoints that receive transcriptions via POST when their hotkey is pressed.",
+        "urlPlaceholder": "https://example.com/api/transcribe",
+        "add": "Add API Destination",
+        "delete": "Delete"
       }
     },
     "models": {
